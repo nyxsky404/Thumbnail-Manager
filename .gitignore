@@ -1,0 +1,9 @@
+# Assets
+Assets/
+
+# Documentation
+documentation.md
+prd.md
+
+# OS
+.DS_Store
