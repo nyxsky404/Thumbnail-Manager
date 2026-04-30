@@ -189,6 +189,7 @@ export function customFontFamilyName(family: string): string {
 
 export async function loadCustomFont(font: CustomFont): Promise<void> {
   if (loadedCustom.has(font.id)) return;
+  console.log("[loadCustomFont] id:", font.id, "url:", font.url);
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       await new Promise((res) => window.setTimeout(res, attempt * 3000));
