@@ -182,17 +182,4 @@ Open <http://localhost:5173>.
 
 Full schema and validation rules at <http://localhost:8000/docs>.
 
-## Out of scope
-
-Canva import, server-side render, multi-user auth, layer/z-index reordering, image overlays, undo/redo, autosave, inline canvas text editing.
-
-## Production hardening checklist
-
-- Switch S3 to private bucket + pre-signed URLs (or CloudFront in front)
-- Restrict Google Fonts API key to your server's IP or service account
-- Set `SERVER_BASE_URL` to your public HTTPS domain
-- Enable HTTPS / TLS termination
-- Tune SlowAPI limits (`default_limits` in `app/main.py`)
-- Configure structured logging shipping (e.g. JSON logs → Loki/CloudWatch)
-- Add monitoring hooks on `/health`
-- Set strong MySQL credentials, enable SSL on the connection string
+#
