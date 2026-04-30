@@ -80,26 +80,30 @@ function ColorField({
 
   return (
     <div ref={ref} className="block">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-full cursor-pointer flex items-center justify-between gap-2"
-      >
-        <span className="text-[11px] text-neutral-400 uppercase">{label}</span>
-        <div className="flex items-center gap-2">
-          <span
-            className="inline-block h-5 w-5 rounded border border-neutral-600"
-            style={{ backgroundColor: value }}
-          />
-          <input
-            value={value}
-            onClick={(e) => e.stopPropagation()}
-            onChange={(e) => onChange(e.target.value)}
-            className="w-20 rounded bg-neutral-800 border border-neutral-700 px-1 py-0.5 text-xs"
-          />
+      <span className="text-[11px] text-neutral-400 uppercase">{label}</span>
+      <div className="mt-0.5 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="h-7 w-7 shrink-0 rounded border border-neutral-600"
+          style={{ backgroundColor: value }}
+          title={open ? "Close color picker" : "Open color picker"}
+          aria-label={open ? "Close color picker" : "Open color picker"}
+        />
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="flex-1 min-w-0 rounded bg-neutral-800 border border-neutral-700 px-2 py-1 text-xs font-mono focus:border-blue-500 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="shrink-0 rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+          aria-label={open ? "Close color picker" : "Open color picker"}
+        >
           {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-        </div>
-      </button>
+        </button>
+      </div>
       {open && (
         <div className="mt-2">
           <HexColorPicker
@@ -453,9 +457,30 @@ export function PropertiesPanel() {
       </Section>
 
       <Section title="Position & Size">
+        <div className="flex items-center gap-1 mb-2">
+          <span className="text-[11px] text-neutral-400 uppercase mr-auto">Text Sizing</span>
+          <ToggleIconButton
+            active={el.textSizing !== "fixed"}
+            onClick={() => update({ textSizing: "auto" })}
+            label="Auto height — grows with content"
+          >
+            <span className="text-[10px] font-medium">Auto</span>
+          </ToggleIconButton>
+          <ToggleIconButton
+            active={el.textSizing === "fixed"}
+            onClick={() => update({ textSizing: "fixed" })}
+            label="Fixed size — clips overflow"
+          >
+            <span className="text-[10px] font-medium">Fixed</span>
+          </ToggleIconButton>
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <NumberField label="Width" value={el.width} onChange={(v) => update({ width: Math.max(20, v) })} />
-          <NumberField label="Height" value={el.height} onChange={(v) => update({ height: Math.max(20, v) })} />
+          <NumberField
+            label={el.textSizing !== "fixed" ? "Height (auto)" : "Height"}
+            value={el.height}
+            onChange={(v) => update({ height: Math.max(20, v), textSizing: "fixed" })}
+          />
           <NumberField label="X" value={el.x} onChange={(v) => update({ x: v })} />
           <NumberField label="Y" value={el.y} onChange={(v) => update({ y: v })} />
         </div>
@@ -469,17 +494,17 @@ export function PropertiesPanel() {
         />
         <div className="grid grid-cols-3 gap-2">
           <NumberField
-            label="Shadow X"
+            label="X"
             value={shadow.x}
             onChange={(v) => update({ shadow: { ...shadow, x: v } })}
           />
           <NumberField
-            label="Shadow Y"
+            label="Y"
             value={shadow.y}
             onChange={(v) => update({ shadow: { ...shadow, y: v } })}
           />
           <NumberField
-            label="Shadow Blur"
+            label="Blur"
             value={shadow.blur}
             min={0}
             onChange={(v) => update({ shadow: { ...shadow, blur: Math.max(0, v) } })}

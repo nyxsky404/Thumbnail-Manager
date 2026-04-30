@@ -28,6 +28,7 @@ export interface TextElement {
   underline?: boolean;
   lineThrough?: boolean;
   shadow?: Shadow;
+  textSizing?: "auto" | "fixed";
 }
 
 export interface CustomFont {
@@ -39,16 +40,28 @@ export interface CustomFont {
   created_at: string;
 }
 
+export interface MissingFont {
+  family: string;
+  weight: string;
+  used_in_element_ids: string[];
+}
+
 export interface Template {
   id: string;
-  user_id: string;
   name: string;
   thumbnail_url: string;
   preset: CanvasPreset;
   canvas_width: number;
   canvas_height: number;
   is_default: boolean;
-  config_json: { elements: TextElement[] };
+  config_json: {
+    elements: TextElement[];
+    /**
+     * Populated by PSD import; empty for PNG-uploaded templates and once the
+     * user has resolved (uploaded fonts for) or dismissed all entries.
+     */
+    missing_fonts?: MissingFont[];
+  };
   custom_fonts: CustomFont[];
   created_at: string;
   updated_at: string;

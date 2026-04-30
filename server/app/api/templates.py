@@ -1,11 +1,23 @@
+import asyncio
 import logging
 from typing import List
 
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..api.google_fonts import get_known_families
 from ..db import get_db
 from ..models import CustomFont, Template
 from ..schemas import (
@@ -15,6 +27,7 @@ from ..schemas import (
 )
 from ..schemas.template import PRESET_DIMENSIONS
 from ..services import s3
+from ..services.psd_import import parse_psd
 from ._uploads import read_with_limit
 
 logger = logging.getLogger(__name__)
@@ -22,6 +35,14 @@ router = APIRouter(prefix="/api/templates", tags=["templates"])
 
 DEFAULT_USER_ID = "default"
 MAX_PNG_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_PSD_SIZE = 50 * 1024 * 1024  # 50 MB — PSDs are typically larger than PNGs
+
+# Magic byte prefixes used to dispatch upload handling. We sniff bytes
+# rather than trust `Content-Type` because browsers report `.psd` as
+# `application/octet-stream`, `image/vnd.adobe.photoshop`, or even
+# `image/x-photoshop` depending on OS/browser.
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_PSD_MAGIC = b"8BPS"
 
 
 def _proxy_thumbnail_url(template_id: str) -> str:
@@ -70,23 +91,60 @@ def get_template(template_id: str, db: Session = Depends(get_db)):
 
 @router.post("", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
 async def create_template(
+    request: Request,
     name: str = Form(..., min_length=1, max_length=255),
     preset: CanvasPreset = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    if file.content_type != "image/png":
-        raise HTTPException(status_code=400, detail="File must be image/png")
+    """Create a template from either a PNG or a PSD upload.
 
-    # Stream-read with an early bail-out so an oversized upload can't force the
-    # server to buffer the full payload before we reject it.
-    body = await read_with_limit(file, MAX_PNG_SIZE)
-    if len(body) < 8 or body[:8] != b"\x89PNG\r\n\x1a\n":
-        raise HTTPException(status_code=400, detail="Invalid PNG magic bytes")
-
+    Dispatch is by magic bytes, not Content-Type — browsers spell PSD's
+    MIME inconsistently. Both code paths produce the same `TemplateOut`
+    response; the PSD path additionally populates `config_json.elements`
+    with text layers extracted from the PSD and `config_json.missing_fonts`
+    with anything that didn't match the Google Fonts catalog.
+    """
     width, height = PRESET_DIMENSIONS[preset]
 
-    # Create row first to get id, then upload thumbnail under prefixed key
+    # Peek the first 8 bytes to dispatch. We can't `await file.read()`
+    # piecemeal then re-read in `read_with_limit`, so we read the whole
+    # file with the larger of the two caps and then verify magic + size.
+    body = await read_with_limit(file, MAX_PSD_SIZE)
+    if len(body) < 8:
+        raise HTTPException(status_code=400, detail="Uploaded file is too small")
+
+    if body[:8] == _PNG_MAGIC:
+        if len(body) > MAX_PNG_SIZE:
+            raise HTTPException(status_code=400, detail="PNG must be <= 10 MB")
+        rendered_png = body
+        text_elements: list[dict] = []
+        missing_fonts: list[dict] = []
+    elif body[:4] == _PSD_MAGIC:
+        try:
+            client = request.app.state.http_client
+            known = await get_known_families(client)
+            parsed = await asyncio.to_thread(
+                parse_psd, body, width, height, known
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:  # noqa: BLE001 — never bubble unparsed psd-tools errors
+            logger.exception("Unexpected PSD parse failure")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to import PSD; check server logs",
+            ) from e
+        rendered_png = parsed.rendered_png
+        text_elements = parsed.text_elements[:20]
+        missing_fonts = [mf.model_dump() for mf in parsed.missing_fonts]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="File must be PNG (\\x89PNG\\r\\n\\x1a\\n) or PSD (8BPS)",
+        )
+
+    # Create row first to get id, then upload thumbnail under prefixed key.
     template = Template(
         user_id=DEFAULT_USER_ID,
         name=name,
@@ -96,13 +154,13 @@ async def create_template(
         canvas_width=width,
         canvas_height=height,
         is_default=False,
-        config_json={"elements": []},
+        config_json={"elements": text_elements, "missing_fonts": missing_fonts},
     )
     db.add(template)
     db.flush()
 
     key = f"templates/{template.id}/thumbnail.png"
-    url = s3.upload_bytes(key, body, "image/png")
+    url = await asyncio.to_thread(s3.upload_bytes, key, rendered_png, "image/png")
     template.thumbnail_url = url
     template.thumbnail_key = key
     db.commit()

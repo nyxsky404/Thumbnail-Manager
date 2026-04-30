@@ -89,7 +89,7 @@ async def catch_all_errors(request: Request, call_next):
         )
         return JSONResponse(
             status_code=500,
-            content={"detail": "Internal server error", "error": str(exc)},
+            content={"detail": "Internal server error"},
         )
 
 

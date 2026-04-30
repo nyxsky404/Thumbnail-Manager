@@ -16,6 +16,30 @@ let inflightFontList: Promise<string[]> | null = null;
 const loadedGoogle = new Set<string>(); // "Family:weights"
 const loadedCustom = new Set<string>(); // CustomFont id
 
+// Signal Konva (and any other renderer that caches glyph metrics) that a new
+// font face has just become available. We can't rely on `document.fonts`
+// `loadingdone` because adding a *pre-loaded* `FontFace` (the path we use for
+// custom fonts in `loadCustomFont`) does not transition the document's font
+// loading state and therefore fires no event. Listeners bump their internal
+// `fontVersion` on this event so cached text-metric calculations get
+// invalidated and the canvas re-flows with the real glyph widths.
+const FONT_LOADED_EVENT = "frammar:fontloaded";
+
+function notifyFontLoaded() {
+  if (typeof window === "undefined") return;
+  try {
+    window.dispatchEvent(new CustomEvent(FONT_LOADED_EVENT));
+  } catch {
+    /* SSR / older browsers — no-op */
+  }
+}
+
+export function onFontLoaded(handler: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(FONT_LOADED_EVENT, handler);
+  return () => window.removeEventListener(FONT_LOADED_EVENT, handler);
+}
+
 export async function fetchGoogleFontList(): Promise<string[]> {
   if (cachedGoogleFontList) return cachedGoogleFontList;
   // Coalesce concurrent callers so we only hit the API once.
@@ -114,6 +138,11 @@ function loadGoogleFamilyWeights(family: string, weights: number[]): Promise<voi
       }
       window.clearTimeout(timer);
       finish();
+      // Wake up Konva (and any other glyph-metrics-cacher) now that the
+      // real font is in document.fonts. document.fonts' own `loadingdone`
+      // event also fires for Google fonts, but we double-tap here so the
+      // signal is consistent across both Google and custom-font paths.
+      notifyFontLoaded();
     };
 
     // If the link was already in the DOM (cache or earlier mount) and its
@@ -168,6 +197,12 @@ export async function loadCustomFont(font: CustomFont): Promise<void> {
     await ff.load();
     (document as any).fonts.add(ff);
     loadedCustom.add(font.id);
+    // Adding an already-loaded FontFace does NOT transition document.fonts
+    // through a load cycle, so `loadingdone` never fires. Notify our own
+    // listeners directly so the canvas re-renders with correct glyph
+    // metrics — without this the user sees clipped/wrong-width text until
+    // they switch fonts and back.
+    notifyFontLoaded();
   } catch (e) {
     console.warn(`Failed to load custom font ${font.family} ${font.weight}:`, e);
   }

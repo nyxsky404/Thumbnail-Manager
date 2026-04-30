@@ -16,8 +16,11 @@ PRESET_DIMENSIONS = {
 }
 
 
+_CSS_COLOR_RE = r"^(#(?:[0-9A-Fa-f]{3,4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})|rgba?\([\d\s,./%]+\)|[a-zA-Z]{2,30})$"
+
+
 class Shadow(BaseModel):
-    color: str = Field(..., max_length=32)
+    color: str = Field(..., max_length=32, pattern=_CSS_COLOR_RE)
     x: float
     y: float
     blur: float = Field(..., ge=0)
@@ -37,17 +40,36 @@ class TextElement(BaseModel):
     fontSize: float = Field(..., gt=0)
     lineHeight: float = Field(..., gt=0)
     letterSpacing: float
-    color: str = Field(..., max_length=32)
-    backgroundColor: Optional[str] = Field(default=None, max_length=32)
+    color: str = Field(..., max_length=32, pattern=_CSS_COLOR_RE)
+    backgroundColor: Optional[str] = Field(default=None, max_length=32, pattern=_CSS_COLOR_RE)
     backgroundOpacity: Optional[float] = Field(default=None, ge=0, le=1)
     align: Literal["left", "center", "right"]
     verticalAlign: Literal["top", "middle", "bottom"]
+    italic: Optional[bool] = None
+    underline: Optional[bool] = None
+    lineThrough: Optional[bool] = None
     shadow: Optional[Shadow] = None
+    textSizing: Optional[Literal["auto", "fixed"]] = None
+
+
+class MissingFont(BaseModel):
+    """A font referenced by an imported PSD that we couldn't resolve against
+    the Google Fonts catalog. The frontend uses this to show a banner with
+    'upload a custom font for X' actions; once the user uploads or dismisses,
+    the entry is removed from `ConfigPayload.missing_fonts`."""
+
+    model_config = ConfigDict(extra="forbid")
+    family: str = Field(..., min_length=1, max_length=255)
+    weight: str = Field(..., min_length=1, max_length=8)
+    used_in_element_ids: List[str] = Field(default_factory=list, max_length=20)
 
 
 class ConfigPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     elements: List[TextElement] = Field(default_factory=list, max_length=20)
+    # Populated by the PSD-import path; empty for templates created from PNGs
+    # or templates whose missing-font issues have all been resolved.
+    missing_fonts: List[MissingFont] = Field(default_factory=list, max_length=20)
 
 
 class TemplateCreate(BaseModel):
@@ -74,7 +96,6 @@ class CustomFontOut(BaseModel):
 class TemplateOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
-    user_id: str
     name: str
     thumbnail_url: str
     preset: str

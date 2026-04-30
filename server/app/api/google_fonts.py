@@ -23,6 +23,7 @@ GET /api/fonts/google/file?url=https://fonts.gstatic.com/...
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -61,6 +62,9 @@ _USER_AGENT = (
 # In-process cache of the catalog (24h TTL). Refreshes lazily on next call.
 _LIST_CACHE: dict[str, Any] = {"data": None, "ts": 0.0}
 _LIST_TTL_SEC = 24 * 60 * 60
+# Serialises concurrent cold-cache callers so only ONE outbound request is
+# made to googleapis.com when the cache is empty or expired (thunder-herd guard).
+_list_lock: asyncio.Lock = asyncio.Lock()
 
 # Allowed hosts for /file proxy. Must be HTTPS Google CDN domains only.
 _ALLOWED_FILE_HOSTS = (
@@ -72,45 +76,93 @@ _ALLOWED_FILE_HOSTS = (
 _URL_RE = re.compile(r"url\(([^)]+)\)")
 
 
-@router.get("/list")
-async def list_fonts(request: Request):
-    """Return the Google Fonts catalog (cached)."""
+async def _fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Return the Google Fonts catalog dict, using the in-process cache.
+
+    Raises HTTPException on configuration / network / upstream errors so
+    callers (route handlers OR other services) get consistent error
+    semantics.
+
+    Uses double-checked locking: the hot path (cache populated) is lock-free;
+    concurrent cold-cache callers serialise so only one outbound request is
+    made to googleapis.com per TTL window.
+    """
     if not settings.GOOGLE_FONTS_API_KEY:
         raise HTTPException(
             status_code=503,
             detail="GOOGLE_FONTS_API_KEY not configured on the server",
         )
 
-    now = time.time()
-    if _LIST_CACHE["data"] and now - _LIST_CACHE["ts"] < _LIST_TTL_SEC:
-        return _LIST_CACHE["data"]
+    # Fast path — no lock needed when the cache is warm.
+    cached = _LIST_CACHE["data"]
+    if cached and time.time() - _LIST_CACHE["ts"] < _LIST_TTL_SEC:
+        return cached  # type: ignore[return-value]
 
+    # Slow path — serialise so exactly one caller makes the outbound request.
+    async with _list_lock:
+        # Re-check under the lock; a concurrent holder may have populated it.
+        cached = _LIST_CACHE["data"]
+        if cached and time.time() - _LIST_CACHE["ts"] < _LIST_TTL_SEC:
+            return cached  # type: ignore[return-value]
+
+        try:
+            r = await client.get(
+                GOOGLE_LIST_URL,
+                params={
+                    "key": settings.GOOGLE_FONTS_API_KEY,
+                    "sort": "popularity",
+                },
+                timeout=10.0,
+            )
+        except httpx.HTTPError as e:
+            logger.warning("Google Fonts list fetch failed: %s", e)
+            raise HTTPException(status_code=502, detail="Failed to reach Google Fonts API")
+
+        if r.status_code != 200:
+            logger.warning(
+                "Google Fonts list returned %s: %s", r.status_code, r.text[:200]
+            )
+            raise HTTPException(
+                status_code=r.status_code,
+                detail="Google Fonts API error",
+            )
+
+        data = r.json()
+        _LIST_CACHE["data"] = data
+        _LIST_CACHE["ts"] = time.time()
+        return data
+
+
+async def get_known_families(client: httpx.AsyncClient) -> set[str]:
+    """Lowercase, whitespace-collapsed family names known to Google Fonts.
+
+    Used by the PSD-import service to decide whether a referenced family is
+    available natively or needs to be flagged to the user as missing.
+    Falls back to an empty set when the catalog can't be fetched (e.g. no
+    API key configured) — the PSD import then conservatively treats *every*
+    font as missing, which is fine and obvious to the user.
+    """
     try:
-        r = await _client(request).get(
-            GOOGLE_LIST_URL,
-            params={
-                "key": settings.GOOGLE_FONTS_API_KEY,
-                "sort": "popularity",
-            },
-            timeout=10.0,
-        )
-    except httpx.HTTPError as e:
-        logger.warning("Google Fonts list fetch failed: %s", e)
-        raise HTTPException(status_code=502, detail="Failed to reach Google Fonts API")
+        data = await _fetch_catalog(client)
+    except HTTPException:
+        return set()
+    out: set[str] = set()
+    for item in data.get("items", []):
+        family = item.get("family")
+        if isinstance(family, str) and family:
+            out.add(_normalise_family(family))
+    return out
 
-    if r.status_code != 200:
-        logger.warning(
-            "Google Fonts list returned %s: %s", r.status_code, r.text[:200]
-        )
-        raise HTTPException(
-            status_code=r.status_code,
-            detail="Google Fonts API error",
-        )
 
-    data = r.json()
-    _LIST_CACHE["data"] = data
-    _LIST_CACHE["ts"] = now
-    return data
+def _normalise_family(name: str) -> str:
+    """Match the same normalisation we apply to PSD-extracted family names."""
+    return " ".join(name.lower().split())
+
+
+@router.get("/list")
+async def list_fonts(request: Request):
+    """Return the Google Fonts catalog (cached)."""
+    return await _fetch_catalog(_client(request))
 
 
 @router.get("/css")

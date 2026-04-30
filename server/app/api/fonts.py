@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -85,7 +86,7 @@ async def upload_font(
 
     key = f"templates/{template_id}/fonts/{cf.id}.{fmt}"
     content_type = "font/otf" if fmt == "otf" else "font/ttf"
-    url = s3.upload_bytes(key, body, content_type)
+    url = await asyncio.to_thread(s3.upload_bytes, key, body, content_type)
     cf.url = url
     cf.s3_key = key
     db.commit()

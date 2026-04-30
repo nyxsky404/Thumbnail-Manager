@@ -70,12 +70,15 @@ export function FontPicker({ value, onChange }: Props) {
       const t = triggerRef.current;
       if (!t) return;
       const r = t.getBoundingClientRect();
-      const desiredWidth = 288; // ~ w-72
-      // Right-align to trigger; clamp to viewport
-      let left = r.right - desiredWidth;
+      // Match the trigger width so the dropdown never overflows left or right.
+      // Apply a minimum so the list is usable even on very narrow triggers.
+      const width = Math.max(r.width, 220);
+      // Left-align to trigger; clamp so it doesn't escape the viewport.
+      let left = r.left;
+      if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
       if (left < 8) left = 8;
       const top = r.bottom + 4;
-      setPos({ top, left, width: desiredWidth });
+      setPos({ top, left, width });
     }
     recompute();
     window.addEventListener("scroll", recompute, true);
@@ -114,9 +117,11 @@ export function FontPicker({ value, onChange }: Props) {
   // results to keep the dropdown responsive on the 1900+ font catalog.
   const SEARCH_CAP = 200;
   const BROWSE_CAP = 80;
-  const filteredGoogle = useMemo(() => {
+  const { filteredGoogle, totalGoogleMatches } = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return googleFonts.slice(0, BROWSE_CAP);
+    if (!q) {
+      return { filteredGoogle: googleFonts.slice(0, BROWSE_CAP), totalGoogleMatches: googleFonts.length };
+    }
     const matches = googleFonts.filter((f) => f.toLowerCase().includes(q));
     matches.sort((a, b) => {
       const ai = a.toLowerCase().indexOf(q);
@@ -124,31 +129,39 @@ export function FontPicker({ value, onChange }: Props) {
       if (ai !== bi) return ai - bi; // earlier-position match first
       return a.localeCompare(b);
     });
-    return matches.slice(0, SEARCH_CAP);
+    return { filteredGoogle: matches.slice(0, SEARCH_CAP), totalGoogleMatches: matches.length };
   }, [googleFonts, query]);
 
-  const totalGoogleMatches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return googleFonts.length;
-    return googleFonts.reduce(
-      (n, f) => (f.toLowerCase().includes(q) ? n + 1 : n),
-      0
-    );
-  }, [googleFonts, query]);
-
+  // Load the font *before* committing the family to the store. Updating
+  // the store first causes Konva to repaint with the new family but the
+  // fallback's glyph metrics, which manifests as clipped/wrong-width text
+  // for a moment. Loading first keeps text rendered in the previous family
+  // (which Konva already has metrics for) until the new face is fully
+  // available.
   async function pickGoogle(family: string) {
-    onChange(family);
     setOpen(false);
-    await loadGoogleFont(family, 400);
+    try {
+      await loadGoogleFont(family, 400);
+    } catch (err) {
+      console.error("Failed to load Google font:", err);
+    }
+    onChange(family);
   }
 
   async function pickCustom(family: string) {
-    onChange(family);
     setOpen(false);
-    if (!template) return;
-    await Promise.all(
-      template.custom_fonts.filter((f) => f.family === family).map(loadCustomFont)
-    );
+    if (template) {
+      try {
+        await Promise.all(
+          template.custom_fonts
+            .filter((f) => f.family === family)
+            .map(loadCustomFont)
+        );
+      } catch (err) {
+        console.error("Failed to load custom font:", err);
+      }
+    }
+    onChange(family);
   }
 
   async function submitUpload(e: React.FormEvent) {

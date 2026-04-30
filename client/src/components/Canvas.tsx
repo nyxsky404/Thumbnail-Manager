@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Stage,
   Layer,
@@ -10,12 +10,20 @@ import {
 } from "react-konva";
 import useImage from "use-image";
 import type Konva from "konva";
+import { Loader2 } from "lucide-react";
 import { useEditorStore } from "../stores/editorStore";
-import { customFontFamilyName } from "../lib/fonts";
+import { customFontFamilyName, onFontLoaded } from "../lib/fonts";
 import type { TextElement, CustomFont } from "../types";
 
 interface Props {
   stageRef?: React.RefObject<Konva.Stage>;
+  /**
+   * When true, render a spinner overlay across the canvas area. Used during
+   * the initial font preload so users don't see text flash in a fallback
+   * font (Konva paints with the fallback metrics that were live at first
+   * paint and only re-flows on the `fontVersion` bump after fonts load).
+   */
+  fontsLoading?: boolean;
 }
 
 function resolveFontFamily(el: TextElement, customFonts: CustomFont[]): string {
@@ -57,6 +65,8 @@ function TextNode({
   const groupRef = useRef<Konva.Group>(null);
   const textRef = useRef<Konva.Text>(null);
   const trRef = useRef<Konva.Transformer>(null);
+  const reportedH = useRef(element.height);
+  const isAuto = element.textSizing !== "fixed";
 
   useEffect(() => {
     if (isSelected && !isEditing && trRef.current && groupRef.current) {
@@ -75,6 +85,23 @@ function TextNode({
     node.fontFamily(node.fontFamily());
     node.getLayer()?.batchDraw();
   }, [fontVersion]);
+
+  // Auto-height: when textSizing is "auto" (default), the Konva Text renders
+  // without a height constraint so it never clips content. We read back the
+  // natural height and sync it to the store so the Properties panel W/H
+  // fields and the hit-test Rect always reflect the real bounding box.
+  // reportedH tracks the last value we wrote so we avoid a render loop.
+  useLayoutEffect(() => {
+    if (!isAuto) return;
+    const node = textRef.current;
+    if (!node) return;
+    const h = Math.ceil(node.height());
+    if (Math.abs(h - reportedH.current) > 0.5) {
+      reportedH.current = h;
+      onChange({ height: h });
+    }
+  }, [element.text, element.fontFamily, element.fontSize, element.fontWeight,
+      element.letterSpacing, element.lineHeight, element.width, isAuto, fontVersion, onChange]);
 
   const family = resolveFontFamily(element, customFonts);
 
@@ -115,41 +142,27 @@ function TextNode({
         // drag; we just need to bake the final size + position back into
         // state when the user releases.
         //
-        // Handle semantics (matches Figma / Canva conventions):
-        //   * Corner drag (both axes scaled, kept in ratio by Konva's
-        //     Transformer) → scale fontSize too so the text grows with the
-        //     box. This is what users expect when resizing a headline.
-        //   * Side drag (only one axis changes) → leave fontSize alone and
-        //     just reshape the box; the text reflows inside.
+        // Resize semantics (Figma / Canva style):
+        //   * Auto mode  — only width handles shown; dragging resizes the box
+        //     width and auto-height re-flows the text to fit.
+        //   * Fixed mode — all 8 handles shown; resizing changes width and/or
+        //     height of the bounding box; fontSize is never scaled.
         onTransformEnd={(e) => {
           const node = e.target as Konva.Group;
           const sx = node.scaleX();
           const sy = node.scaleY();
-
-          const EPS = 0.001;
-          const sxChanged = Math.abs(sx - 1) > EPS;
-          const syChanged = Math.abs(sy - 1) > EPS;
-          const isCornerDrag = sxChanged && syChanged;
-
           const newWidth = Math.max(20, element.width * sx);
-          const newHeight = Math.max(20, element.height * sy);
-
-          // For corner drags, Transformer.keepRatio (default true on corners)
-          // makes sx === sy so the average is just that scale; using the
-          // average also degrades gracefully if a future change opts out of
-          // keepRatio. Clamp the resulting fontSize to a sensible range.
-          let newFontSize = element.fontSize;
-          if (isCornerDrag) {
-            const fontScale = (sx + sy) / 2;
-            newFontSize = Math.max(8, Math.min(512, Math.round(element.fontSize * fontScale)));
-          }
-
+          // Auto-height: height is managed by text content — don't bake a
+          // scaled value; the useLayoutEffect will re-sync after reflow.
+          // Fixed: honour the drag and resize the bounding box.
+          const newHeight = isAuto
+            ? element.height
+            : Math.max(20, element.height * sy);
           node.scaleX(1);
           node.scaleY(1);
           onChange({
             width: newWidth,
             height: newHeight,
-            ...(isCornerDrag ? { fontSize: newFontSize } : null),
             x: node.x(),
             y: node.y(),
           });
@@ -170,7 +183,7 @@ function TextNode({
           x={0}
           y={0}
           width={element.width}
-          height={element.height}
+          height={isAuto ? undefined : element.height}
           text={element.text}
           fontFamily={family}
           fontStyle={`${element.italic ? "italic " : ""}${element.fontWeight}`}
@@ -201,16 +214,20 @@ function TextNode({
         <Transformer
           ref={trRef}
           rotateEnabled={false}
-          enabledAnchors={[
-            "top-left",
-            "top-right",
-            "bottom-left",
-            "bottom-right",
-            "middle-left",
-            "middle-right",
-            "top-center",
-            "bottom-center",
-          ]}
+          enabledAnchors={
+            isAuto
+              ? ["middle-left", "middle-right"]
+              : [
+                  "top-left",
+                  "top-right",
+                  "bottom-left",
+                  "bottom-right",
+                  "middle-left",
+                  "middle-right",
+                  "top-center",
+                  "bottom-center",
+                ]
+          }
           boundBoxFunc={(oldBox, newBox) => {
             if (newBox.width < 20 || newBox.height < 20) return oldBox;
             return newBox;
@@ -262,7 +279,8 @@ function InlineEditor({
         left: element.x * scale,
         top: element.y * scale,
         width: element.width * scale,
-        height: element.height * scale,
+        height: element.textSizing === "fixed" ? element.height * scale : undefined,
+        minHeight: Math.ceil(element.fontSize * element.lineHeight * scale),
         fontFamily: family,
         fontWeight: element.fontWeight as any,
         fontStyle: element.italic ? "italic" : "normal",
@@ -281,18 +299,18 @@ function InlineEditor({
         background:
           element.backgroundColor && element.backgroundOpacity !== 0
             ? element.backgroundColor
-            : "rgba(0,0,0,0.15)",
+            : "transparent",
         opacity: element.backgroundColor
           ? element.backgroundOpacity ?? 1
           : 1,
-        border: "2px dashed #3b82f6",
+        border: "1.5px solid rgba(59,130,246,0.7)",
         outline: "none",
+        zIndex: 40,
         margin: 0,
         padding: 0,
         resize: "none",
-        overflow: "hidden",
+        overflow: element.textSizing === "fixed" ? "hidden" : "visible",
         boxSizing: "border-box",
-        display: "flex",
         // textarea ignores verticalAlign; approximate via padding
         // (vertical centering for textarea is hard without flex on parent)
       }}
@@ -300,26 +318,51 @@ function InlineEditor({
   );
 }
 
-export function Canvas({ stageRef }: Props) {
+export function Canvas({ stageRef, fontsLoading }: Props) {
   const template = useEditorStore((s) => s.template);
   const selectedId = useEditorStore((s) => s.selectedId);
   const selectElement = useEditorStore((s) => s.selectElement);
   const updateElement = useEditorStore((s) => s.updateElement);
   const addText = useEditorStore((s) => s.addText);
+  const removeElement = useEditorStore((s) => s.removeElement);
 
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  // Bump on every `document.fonts.loadingdone` so child Text nodes know to
-  // recompute their cached glyph metrics. Without this, the canvas keeps
-  // rendering with the fallback font that was in place at first paint.
+  // Bump on every successful font load so child Text nodes know to recompute
+  // their cached glyph metrics. We listen to TWO sources:
+  //   1. `document.fonts.loadingdone` — fires when the document's overall
+  //      font-loading state goes idle (covers `<link>`-injected Google CSS).
+  //   2. Our own `onFontLoaded` — fires when `loadCustomFont` adds an
+  //      already-loaded FontFace (which does NOT transition document.fonts'
+  //      state and therefore would never fire `loadingdone`). Without this,
+  //      picking a custom font shows clipped text in the fallback metrics
+  //      until the user switches fonts and back to force a re-render.
   const [fontVersion, setFontVersion] = useState(0);
   useEffect(() => {
+    const bump = () => setFontVersion((v) => v + 1);
     const fonts: any = (document as any).fonts;
-    if (!fonts || typeof fonts.addEventListener !== "function") return;
-    const onLoadingDone = () => setFontVersion((v) => v + 1);
-    fonts.addEventListener("loadingdone", onLoadingDone);
-    return () => fonts.removeEventListener("loadingdone", onLoadingDone);
+    fonts?.addEventListener?.("loadingdone", bump);
+    const off = onFontLoaded(bump);
+    return () => {
+      fonts?.removeEventListener?.("loadingdone", bump);
+      off();
+    };
   }, []);
+
+  // Delete / Backspace removes the selected element when not actively editing.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!selectedId || editingId) return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        removeElement(selectedId);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [selectedId, editingId, removeElement]);
 
   // Same-origin via Vite proxy → no `crossOrigin` needed. Avoids Brave
   // Shields blocking and avoids `<img crossorigin>` cache mismatches with
@@ -329,14 +372,16 @@ export function Canvas({ stageRef }: Props) {
   const [size, setSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
-    const update = () => {
-      if (!containerRef.current) return;
-      const r = containerRef.current.getBoundingClientRect();
-      setSize({ width: r.width, height: r.height });
-    };
-    update();
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const { width, height } = entry.contentRect;
+      setSize({ width, height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
   const scale = useMemo(() => {
@@ -374,7 +419,17 @@ export function Canvas({ stageRef }: Props) {
       className="relative flex-1 flex items-center justify-center bg-neutral-950 p-6 overflow-hidden"
     >
       <div
-        style={{ width: stageW, height: stageH }}
+        style={{
+          width: stageW,
+          height: stageH,
+          // Photoshop-style transparency checker. Two-tone dark squares so
+          // transparent regions of the template are visibly empty (vs. just
+          // looking like a solid dark background). Uses a conic-gradient
+          // 2×2 tile sized at 16px → 8px-square checkers.
+          backgroundImage:
+            "conic-gradient(#1f1f1f 25%, #2a2a2a 0 50%, #1f1f1f 0 75%, #2a2a2a 0)",
+          backgroundSize: "16px 16px",
+        }}
         className="relative shadow-2xl"
       >
         <Stage
@@ -402,7 +457,10 @@ export function Canvas({ stageRef }: Props) {
               y={0}
               width={cw}
               height={ch}
-              fill="#1a1a1a"
+              // Near-zero alpha keeps the rect hit-detectable (Konva won't
+              // hit-test a Rect with no fill) while letting the wrapper-div
+              // checkerboard show through transparent template regions.
+              fill="rgba(0,0,0,0.001)"
               name="background"
             />
             {bgImage && bg && (
@@ -446,6 +504,23 @@ export function Canvas({ stageRef }: Props) {
             onChange={(text) => updateElement(editingElement.id, { text })}
             onCommit={() => setEditingId(null)}
           />
+        )}
+
+        {/*
+          Font-load overlay. Painted while the editor is preloading custom
+          and Google fonts so users don't see text flash in a system fallback
+          before the real font swaps in. Sits above the Stage but below the
+          inline editor (which only mounts when the user is actively typing).
+        */}
+        {fontsLoading && (
+          <div
+            className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-neutral-950/70 backdrop-blur-sm"
+            role="status"
+            aria-live="polite"
+          >
+            <Loader2 size={28} className="animate-spin text-neutral-200" />
+            <span className="text-sm text-neutral-300">Loading fonts…</span>
+          </div>
         )}
       </div>
 

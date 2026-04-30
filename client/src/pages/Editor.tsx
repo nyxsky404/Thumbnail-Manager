@@ -12,6 +12,7 @@ import {
 import type Konva from "konva";
 import { useEditorStore } from "../stores/editorStore";
 import { Canvas } from "../components/Canvas";
+import { MissingFontsBanner } from "../components/MissingFontsBanner";
 import { PropertiesPanel } from "../components/PropertiesPanel";
 import { loadAllCustomFonts, loadGoogleFont } from "../lib/fonts";
 import { sanitizeFilename } from "../lib/utils";
@@ -291,8 +292,10 @@ export function Editor() {
         </div>
       )}
 
+      <MissingFontsBanner />
+
       <div className="flex flex-1 min-h-0">
-        <Canvas stageRef={stageRef} />
+        <Canvas stageRef={stageRef} fontsLoading={fontsLoading} />
         <PropertiesPanel />
       </div>
     </div>

@@ -31,13 +31,23 @@ export const useTemplatesStore = create<TemplatesState>((set, get) => ({
     return t;
   },
   async remove(id) {
-    await api.deleteTemplate(id);
-    await get().load();
+    try {
+      await api.deleteTemplate(id);
+      set({ templates: get().templates.filter((t) => t.id !== id) });
+    } catch (e: any) {
+      set({ error: e.message });
+      throw e;
+    }
   },
   async setDefault(id) {
-    await api.setDefault(id);
-    set({
-      templates: get().templates.map((t) => ({ ...t, is_default: t.id === id })),
-    });
+    try {
+      await api.setDefault(id);
+      set({
+        templates: get().templates.map((t) => ({ ...t, is_default: t.id === id })),
+      });
+    } catch (e: any) {
+      set({ error: e.message });
+      throw e;
+    }
   },
 }));

@@ -12,6 +12,9 @@ interface EditorState {
   /** epoch ms of the most recent successful save; null if never saved. */
   lastSavedAt: number | null;
   error: string | null;
+  /** Internal: handle for the auto-dismiss timer on transient validation errors.
+   *  Stored in state (not module-scope) so Vite HMR doesn't orphan it. */
+  _transientTimer: ReturnType<typeof setTimeout> | null;
 
   load: (id: string) => Promise<void>;
   reset: () => void;
@@ -26,6 +29,18 @@ interface EditorState {
   addCustomFont: (font: CustomFont) => void;
   removeCustomFont: (id: string) => void;
 
+  /**
+   * Mark a missing-font entry as resolved. Switches every text element that
+   * was originally using the family back to it (it had been temporarily
+   * forced to "Roboto" by the PSD importer) and removes the entry from
+   * `template.config_json.missing_fonts`. Mutates `dirty` so autosave
+   * persists the changes.
+   */
+  resolveMissingFont: (family: string) => void;
+
+  /** Drop all missing-font entries without re-targeting any text. */
+  dismissMissingFonts: () => void;
+
   clearError: () => void;
 
   save: () => Promise<void>;
@@ -36,7 +51,6 @@ interface EditorState {
 // (load/save) are NOT auto-dismissed — the user needs to see those until they
 // take action.
 const TRANSIENT_ERROR_MS = 4000;
-let transientErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
 function defaultElement(canvasWidth: number, canvasHeight: number): TextElement {
   return {
@@ -46,6 +60,7 @@ function defaultElement(canvasWidth: number, canvasHeight: number): TextElement 
     y: (canvasHeight - 80) / 2,
     width: 400,
     height: 80,
+    textSizing: "auto" as const,
     fontFamily: "Roboto",
     fontWeight: "400",
     fontSize: 48,
@@ -65,14 +80,19 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   saving: false,
   lastSavedAt: null,
   error: null,
+  _transientTimer: null,
 
   async load(id) {
+    const { _transientTimer } = get();
+    if (_transientTimer) clearTimeout(_transientTimer);
     set({
       template: null,
       selectedId: null,
       dirty: false,
+      saving: false,
       lastSavedAt: null,
       error: null,
+      _transientTimer: null,
     });
     try {
       const t = await api.getTemplate(id);
@@ -83,12 +103,16 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   reset() {
+    const { _transientTimer } = get();
+    if (_transientTimer) clearTimeout(_transientTimer);
     set({
       template: null,
       selectedId: null,
       dirty: false,
+      saving: false,
       lastSavedAt: null,
       error: null,
+      _transientTimer: null,
     });
   },
 
@@ -104,21 +128,21 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     if (t.config_json.elements.length >= MAX_TEXT_ELEMENTS) {
       // Transient validation error: show it briefly then auto-clear so the
       // banner doesn't stick around after the user deletes an element.
-      set({ error: `Max ${MAX_TEXT_ELEMENTS} text elements per template.` });
-      if (transientErrorTimer) clearTimeout(transientErrorTimer);
-      transientErrorTimer = setTimeout(() => {
+      const { _transientTimer: prev } = get();
+      if (prev) clearTimeout(prev);
+      const timer = setTimeout(() => {
         // Only clear if the error is still the same one we just set; a later
         // hard error (e.g. failed save) must not be wiped out by this timer.
-        if (get().error?.startsWith("Max ")) set({ error: null });
-        transientErrorTimer = null;
+        if (get().error?.startsWith("Max ")) set({ error: null, _transientTimer: null });
       }, TRANSIENT_ERROR_MS);
+      set({ error: `Max ${MAX_TEXT_ELEMENTS} text elements per template.`, _transientTimer: timer });
       return;
     }
     const el = defaultElement(t.canvas_width, t.canvas_height);
     set({
       template: {
         ...t,
-        config_json: { elements: [...t.config_json.elements, el] },
+        config_json: { ...t.config_json, elements: [...t.config_json.elements, el] },
       },
       selectedId: el.id,
       dirty: true,
@@ -132,6 +156,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       template: {
         ...t,
         config_json: {
+          ...t.config_json,
           elements: t.config_json.elements.map((e) =>
             e.id === id ? { ...e, ...patch } : e
           ),
@@ -142,16 +167,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   removeElement(id) {
-    const t = get().template;
+    const { template: t, selectedId } = get();
     if (!t) return;
     set({
       template: {
         ...t,
         config_json: {
+          ...t.config_json,
           elements: t.config_json.elements.filter((e) => e.id !== id),
         },
       },
-      selectedId: get().selectedId === id ? null : get().selectedId,
+      selectedId: selectedId === id ? null : selectedId,
       dirty: true,
     });
   },
@@ -169,8 +195,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     set({
       template: {
         ...t,
-        config_json: { elements: [...others, el] },
+        config_json: { ...t.config_json, elements: [...others, el] },
       },
+      dirty: true,
     });
   },
 
@@ -193,12 +220,46 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     });
   },
 
+  resolveMissingFont(family) {
+    const t = get().template;
+    if (!t) return;
+    const list = t.config_json.missing_fonts ?? [];
+    const entry = list.find((m) => m.family === family);
+    if (!entry) return;
+    const targetIds = new Set(entry.used_in_element_ids);
+    set({
+      template: {
+        ...t,
+        config_json: {
+          ...t.config_json,
+          elements: t.config_json.elements.map((e) =>
+            targetIds.has(e.id) ? { ...e, fontFamily: family } : e
+          ),
+          missing_fonts: list.filter((m) => m.family !== family),
+        },
+      },
+      dirty: true,
+    });
+  },
+
+  dismissMissingFonts() {
+    const t = get().template;
+    if (!t) return;
+    if (!(t.config_json.missing_fonts && t.config_json.missing_fonts.length))
+      return;
+    set({
+      template: {
+        ...t,
+        config_json: { ...t.config_json, missing_fonts: [] },
+      },
+      dirty: true,
+    });
+  },
+
   clearError() {
-    if (transientErrorTimer) {
-      clearTimeout(transientErrorTimer);
-      transientErrorTimer = null;
-    }
-    set({ error: null });
+    const { _transientTimer } = get();
+    if (_transientTimer) clearTimeout(_transientTimer);
+    set({ error: null, _transientTimer: null });
   },
 
   async save() {
