@@ -189,7 +189,8 @@ export function customFontFamilyName(family: string): string {
 
 export async function loadCustomFont(font: CustomFont): Promise<void> {
   if (loadedCustom.has(font.id)) return;
-  console.log("[loadCustomFont] id:", font.id, "url:", font.url);
+  const _apiBase = (import.meta as any).env.VITE_API_URL || "";
+  const resolvedUrl = font.url.startsWith("/") ? `${_apiBase}${font.url}` : font.url;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       await new Promise((res) => window.setTimeout(res, attempt * 3000));
@@ -197,7 +198,7 @@ export async function loadCustomFont(font: CustomFont): Promise<void> {
     try {
       const ff = new FontFace(
         customFontFamilyName(font.family),
-        `url(${font.url})`,
+        `url(${resolvedUrl})`,
         { weight: String(font.weight), style: "normal" }
       );
       await ff.load();
