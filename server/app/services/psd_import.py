@@ -30,6 +30,7 @@ Limitations (intentional, see docs/plans):
 """
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import re
@@ -58,7 +59,9 @@ class ParsedPsd:
 
 # Maximum side-length we'll feed to PIL when contain-fit-resizing. Guards
 # against absurd PSDs (e.g. 30,000 px wide) eating all RAM before we resize.
-_MAX_INPUT_DIMENSION = 8192
+# 4096 is more than enough for any thumbnail preset (max 1920px side) and
+# halves peak memory versus the old 8192 limit.
+_MAX_INPUT_DIMENSION = 4096
 
 
 # PostScript-name suffixes Photoshop appends to the family name. We strip
@@ -380,9 +383,12 @@ def parse_psd(
             if li is None or li.mode != "RGBA":
                 return False
             alpha = li.split()[-1]
+            del li  # free full-res composite immediately
             # Use a coarse downsample to keep this cheap on huge PSDs.
             small = alpha.resize((64, 64))
-            pixels = small.getdata()
+            del alpha
+            pixels = list(small.getdata())
+            del small
             mean = sum(pixels) / max(1, len(pixels))
             return mean > 230  # ≥90% opaque on average
         except Exception:  # noqa: BLE001
@@ -496,6 +502,8 @@ def parse_psd(
             except Exception:  # noqa: BLE001
                 logger.warning("Could not paste pass-through group %r: %s",
                                getattr(grp, "name", "?"), e)
+        finally:
+            del grp_img  # free the per-group composite immediately after paste
 
     # 2. Compute contain-fit transform from PSD coords -> canvas coords.
     scale = min(target_w / native_w, target_h / native_h)
@@ -511,11 +519,21 @@ def parse_psd(
         resized = composite.resize((fitted_w, fitted_h), Image.Resampling.LANCZOS)
     else:
         resized = composite
+    # Free the full-res composite before pasting; `resized` is the same
+    # object when no resize was needed, so rebind via a new name first.
+    del composite
     canvas.paste(resized, (offset_x, offset_y), resized)
+    del resized
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
     rendered_png = buf.getvalue()
+    buf.close()
+    del canvas, buf
+    # Force CPython to reclaim the large PIL image buffers now rather than
+    # waiting for the next GC cycle — we're about to do text-layer work that
+    # doesn't need them and we want memory back on the heap ASAP.
+    gc.collect()
 
     # 4. Walk all layers (recursively descend into groups) and pick out text.
     text_elements: list[dict[str, Any]] = []
