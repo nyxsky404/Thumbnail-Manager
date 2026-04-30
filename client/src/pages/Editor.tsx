@@ -122,7 +122,7 @@ export function Editor() {
       ...Array.from(usedFamilies).map((f) => loadGoogleFont(f, 400)),
     ]);
     // Hard ceiling so we never sit on the spinner indefinitely.
-    const ceiling = new Promise<void>((res) => window.setTimeout(res, 8000));
+    const ceiling = new Promise<void>((res) => window.setTimeout(res, 30000));
 
     Promise.race([blocking, ceiling]).then(() => {
       if (!cancelled) setFontsLoading(false);

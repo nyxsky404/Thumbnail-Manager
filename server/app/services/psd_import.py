@@ -196,6 +196,61 @@ def _extract_first_style(layer: Any) -> dict[str, Any]:
         return {}
 
 
+def _para_styles(layer: Any) -> list[dict[str, Any]]:
+    """Return one StyleSheetData dict per paragraph in the text layer.
+
+    Uses StyleRun.RunLengthArray to map each character to its style run, then
+    picks the first run that touches each \\r-delimited paragraph.  Falls back
+    to a single _extract_first_style() result if engine data is unavailable.
+    """
+    try:
+        raw = layer.text or ""
+        engine = layer.engine_dict or {}
+        sr = engine.get("StyleRun", {})
+        run_array = sr.get("RunArray") or []
+        run_lens_raw = sr.get("RunLengthArray") or []
+        if not run_array or not run_lens_raw:
+            return [_extract_first_style(layer)]
+
+        run_lens = [int(x) for x in run_lens_raw]
+
+        def _style_for_run(run_idx: int) -> dict[str, Any]:
+            if run_idx >= len(run_array):
+                return {}
+            entry = run_array[run_idx]
+            if not _isdictlike(entry):
+                return {}
+            run_data = entry.get("RunData")
+            sheet = None
+            if _isdictlike(run_data):
+                sheet = run_data.get("StyleSheet")
+            if not _isdictlike(sheet):
+                sheet = entry.get("StyleSheet")
+            if not _isdictlike(sheet):
+                return {}
+            ssd = sheet.get("StyleSheetData")
+            return dict(ssd) if _isdictlike(ssd) else {}
+
+        paras = raw.split("\r")
+        result: list[dict[str, Any]] = []
+        char_pos = 0
+        for para in paras:
+            # Walk run boundaries to find which run covers char_pos.
+            cumulative = 0
+            dominant = max(0, len(run_lens) - 1)
+            for ri, rl in enumerate(run_lens):
+                cumulative += rl
+                if char_pos < cumulative:
+                    dominant = ri
+                    break
+            result.append(_style_for_run(dominant))
+            char_pos += len(para) + 1  # +1 for the \r we split on
+
+        return result if result else [_extract_first_style(layer)]
+    except Exception:  # noqa: BLE001
+        return [_extract_first_style(layer)]
+
+
 def _isdictlike(x: Any) -> bool:
     """True if `x` supports `.get()` and key indexing — covers psd-tools' Dict
     wrapper class as well as plain dicts."""
@@ -541,7 +596,7 @@ def parse_psd(
 
     for layer in _iter_text_layers(root):
         try:
-            element, family_for_lookup, weight = _layer_to_element(
+            layer_elems = _layer_to_elements(
                 layer,
                 scale=scale,
                 offset_x=offset_x,
@@ -555,22 +610,23 @@ def parse_psd(
             logger.warning("Skipping unreadable text layer %r: %s", getattr(layer, "name", "?"), e)
             continue
 
-        if family_for_lookup and _normalise_family(family_for_lookup) not in known_families:
-            entry = missing_by_family.get(family_for_lookup)
-            if entry is None:
-                entry = MissingFont(
-                    family=family_for_lookup,
-                    weight=weight,
-                    used_in_element_ids=[element["id"]],
-                )
-                missing_by_family[family_for_lookup] = entry
-            else:
-                entry.used_in_element_ids.append(element["id"])
-            # Switch the element to a guaranteed-renderable family until the
-            # user uploads a real one.
-            element["fontFamily"] = "Roboto"
+        for element, family_for_lookup, weight in layer_elems:
+            if family_for_lookup and _normalise_family(family_for_lookup) not in known_families:
+                entry = missing_by_family.get(family_for_lookup)
+                if entry is None:
+                    entry = MissingFont(
+                        family=family_for_lookup,
+                        weight=weight,
+                        used_in_element_ids=[element["id"]],
+                    )
+                    missing_by_family[family_for_lookup] = entry
+                else:
+                    entry.used_in_element_ids.append(element["id"])
+                # Switch the element to a guaranteed-renderable family until the
+                # user uploads a real one.
+                element["fontFamily"] = "Roboto"
 
-        text_elements.append(element)
+            text_elements.append(element)
 
     return ParsedPsd(
         rendered_png=rendered_png,
@@ -664,6 +720,13 @@ def _layer_to_element(
     strikethrough = bool(style.get("Strikethrough", False))
     faux_bold = bool(style.get("FauxBold", False))
     faux_italic = bool(style.get("FauxItalic", False))
+    # FontCaps: 0=normal, 1=small-caps, 2=all-caps (Photoshop engine data key).
+    # The more obvious "AllCaps" key does not exist in this format.
+    font_caps = int(style.get("FontCaps", 0) or 0)
+    # Photoshop stores the original-case string and renders it uppercase
+    # via a style flag — uppercase on import to match the visual.
+    if font_caps == 2:
+        text = text.upper()
 
     ps_name = _resolve_font_name(layer, font_idx)
     family, weight, italic = _split_postscript_name(ps_name)
@@ -776,6 +839,7 @@ def _layer_to_element(
         "lineHeight": line_height,
         "letterSpacing": tracking / 1000.0 * font_size,  # PSD tracking is per-1000em
         "color": color_hex,
+        "textSizing": "auto",
         "align": align,
         "verticalAlign": "top",
         "italic": italic,
@@ -783,5 +847,102 @@ def _layer_to_element(
         "lineThrough": strikethrough,
     }
     return element, family or "Roboto", weight
+
+
+def _layer_to_elements(
+    layer: Any,
+    *,
+    scale: float,
+    offset_x: int,
+    offset_y: int,
+    canvas_w: int,
+    canvas_h: int,
+    psd_offset_x: int = 0,
+    psd_offset_y: int = 0,
+) -> list[tuple[dict[str, Any], str, str]]:
+    """Like _layer_to_element but splits multi-colour paragraphs.
+
+    Most layers are single-colour and return a one-item list.  When different
+    paragraphs inside the same PSD text layer carry different fill colours
+    (e.g. a white headline with a yellow sub-line, as in the Moneycontrol
+    template), each paragraph becomes its own TextElement stacked vertically.
+    """
+    element, family, weight = _layer_to_element(
+        layer,
+        scale=scale,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        psd_offset_x=psd_offset_x,
+        psd_offset_y=psd_offset_y,
+    )
+
+    raw = layer.text or ""
+    # PSD paragraph separator is CR; strip trailing separators before splitting.
+    paras = [p for p in raw.rstrip("\r").split("\r") if p.strip()]
+    if len(paras) <= 1:
+        return [(element, family, weight)]
+
+    para_styles_list = _para_styles(layer)
+
+    def _color_for(style: dict) -> str:
+        fc = style.get("FillColor")
+        vals = (fc.get("Values") or []) if _isdictlike(fc) else []
+        return _argb_floats_to_hex(vals) if vals else "#FFFFFF"
+
+    colors = [_color_for(s) for s in para_styles_list]
+    # Pad colors list so it always aligns with paras.
+    while len(colors) < len(paras):
+        colors.append(colors[-1] if colors else "#FFFFFF")
+
+    # If every paragraph shares the same color, no split needed — update
+    # element color from the first run (fixes the all-white fallback) and
+    # return as a single element.
+    unique_colors = {c.lower() for c in colors[: len(paras)]}
+    if len(unique_colors) <= 1:
+        element["color"] = colors[0]
+        return [(element, family, weight)]
+
+    # Multi-colour: split into one element per paragraph.
+    font_size = element["fontSize"]
+    line_height = element["lineHeight"]
+    per_line_h = font_size * line_height
+    results: list[tuple[dict[str, Any], str, str]] = []
+    current_y = element["y"]
+    for para_text, style, color in zip(paras, para_styles_list, colors):
+        # Estimate wrapped line count so we can set a sensible height.
+        lines_est = max(1, round(len(para_text) * font_size * 0.62 / max(1.0, element["width"])))
+        para_h = max(20.0, lines_est * per_line_h + font_size * 0.2)
+        # Clamp so we don't overflow the canvas.
+        para_h = min(para_h, max(20.0, canvas_h - current_y))
+
+        # Apply per-paragraph caps transform (FontCaps 2 = all-caps).
+        if int(style.get("FontCaps", 0) or 0) == 2:
+            para_text = para_text.upper()
+
+        # Per-run font info (some layers also change font/weight per run).
+        para_font_idx = int(style.get("Font", 0) or 0)
+        para_ps = _resolve_font_name(layer, para_font_idx)
+        para_family, para_weight, para_italic = _split_postscript_name(para_ps)
+        if not para_family:
+            para_family, para_weight, para_italic = family, weight, bool(element.get("italic", False))
+
+        sub = {
+            **element,
+            "id": uuid.uuid4().hex[:12],
+            "text": para_text,
+            "y": current_y,
+            "height": para_h,
+            "color": color,
+            "fontFamily": para_family or family,
+            "fontWeight": para_weight or weight,
+            "italic": para_italic,
+            "textSizing": "auto",
+        }
+        results.append((sub, para_family or family, para_weight or weight))
+        current_y += para_h
+
+    return results if results else [(element, family, weight)]
 
 

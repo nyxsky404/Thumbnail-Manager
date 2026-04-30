@@ -189,23 +189,26 @@ export function customFontFamilyName(family: string): string {
 
 export async function loadCustomFont(font: CustomFont): Promise<void> {
   if (loadedCustom.has(font.id)) return;
-  try {
-    const ff = new FontFace(
-      customFontFamilyName(font.family),
-      `url(${font.url})`,
-      { weight: String(font.weight), style: "normal" }
-    );
-    await ff.load();
-    (document as any).fonts.add(ff);
-    loadedCustom.add(font.id);
-    // Adding an already-loaded FontFace does NOT transition document.fonts
-    // through a load cycle, so `loadingdone` never fires. Notify our own
-    // listeners directly so the canvas re-renders with correct glyph
-    // metrics — without this the user sees clipped/wrong-width text until
-    // they switch fonts and back.
-    notifyFontLoaded();
-  } catch (e) {
-    console.warn(`Failed to load custom font ${font.family} ${font.weight}:`, e);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise((res) => window.setTimeout(res, attempt * 3000));
+    }
+    try {
+      const ff = new FontFace(
+        customFontFamilyName(font.family),
+        `url(${font.url})`,
+        { weight: String(font.weight), style: "normal" }
+      );
+      await ff.load();
+      (document as any).fonts.add(ff);
+      loadedCustom.add(font.id);
+      notifyFontLoaded();
+      return;
+    } catch (e) {
+      if (attempt === 2) {
+        console.warn(`Failed to load custom font ${font.family} ${font.weight}:`, e);
+      }
+    }
   }
 }
 
