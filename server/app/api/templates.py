@@ -25,6 +25,7 @@ from ..schemas import (
     TemplateOut,
     TemplateUpdate,
 )
+from ..config import settings
 from ..schemas.template import PRESET_DIMENSIONS
 from ..services import s3
 from ..services.psd_import import parse_psd
@@ -46,16 +47,11 @@ _PSD_MAGIC = b"8BPS"
 
 
 def _proxy_thumbnail_url(template_id: str) -> str:
-    # Relative URL: the browser resolves it against the page origin, so the
-    # request goes to whatever serves the SPA (Vite dev server in dev, your
-    # reverse proxy in prod). That host is responsible for forwarding /api/*
-    # to this FastAPI backend. Keeping it same-origin avoids CORS, browser
-    # extensions like Brave Shields, and <img crossorigin> cache pitfalls.
-    return f"/api/templates/{template_id}/thumbnail"
+    return f"{settings.SERVER_BASE_URL}/api/templates/{template_id}/thumbnail"
 
 
 def _proxy_font_url(template_id: str, font_id: str) -> str:
-    return f"/api/templates/{template_id}/fonts/{font_id}/file"
+    return f"{settings.SERVER_BASE_URL}/api/templates/{template_id}/fonts/{font_id}/file"
 
 
 def _to_out(t: Template) -> TemplateOut:

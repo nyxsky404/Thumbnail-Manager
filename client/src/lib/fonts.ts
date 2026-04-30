@@ -8,8 +8,9 @@ import { slugify } from "./utils";
 //   * corporate DNS blocks
 //   * leaking the API key into the client bundle
 // The endpoints are defined in server/app/api/google_fonts.py.
-const LIST_URL = "/api/fonts/google/list";
-const CSS_URL = "/api/fonts/google/css";
+const _BASE = (import.meta as any).env.VITE_API_URL || "";
+const LIST_URL = `${_BASE}/api/fonts/google/list`;
+const CSS_URL = `${_BASE}/api/fonts/google/css`;
 
 let cachedGoogleFontList: string[] | null = null;
 let inflightFontList: Promise<string[]> | null = null;
